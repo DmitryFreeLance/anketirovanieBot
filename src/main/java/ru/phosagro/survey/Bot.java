@@ -5,6 +5,7 @@ import com.pengrad.telegrambot.TelegramBot;
 import com.pengrad.telegrambot.UpdatesListener;
 import com.pengrad.telegrambot.model.*;
 import com.pengrad.telegrambot.model.request.InlineKeyboardMarkup;
+import com.pengrad.telegrambot.model.request.ParseMode;
 import com.pengrad.telegrambot.request.*;
 import ru.phosagro.survey.db.Db;
 import ru.phosagro.survey.model.Option;
@@ -83,11 +84,11 @@ public class Bot {
             if (q == null) return;
 
             if (q.getType() == QuestionType.MULTI) {
-                // MULTI: добавить "Другое: ..." в выбор и перерисовать то же сообщение (или финализировать)
+                // MULTI: добавить свой вариант и перерисовать то же сообщение (или финализировать)
                 handleFreeTextForMulti(chatId, tgUser.id(), q, text);
                 return;
             } else {
-                // TEXT или SINGLE с «Другое»: редактируем текущее сообщение → "Ответ: …", затем следующий вопрос
+                // TEXT или SINGLE с «Другое»: редактируем текущее сообщение → "Ваш ответ: …", затем следующий вопрос
                 editCurrentToAnswer(chatId, tgUser.id(), q, text);
                 // сохранить ответ и перейти дальше
                 String resp = surveyService.acceptFreeText(tgUser.id(), text); // это продвинет индекс/завершит
@@ -249,7 +250,7 @@ public class Bot {
             if (q == null) { bot.execute(new AnswerCallbackQuery(cb.id())); return; }
 
             if ("s".equals(kind) || "r".equals(kind)) {
-                // Сначала редактируем текущее сообщение на "Ответ: ..."
+                // Сначала редактируем текущее сообщение на "Ваш ответ: ..."
                 Integer msgId = db.getCurrentMessageId(uid);
                 String chosen;
                 if ("r".equals(kind)) chosen = parts[3];
@@ -259,8 +260,8 @@ public class Bot {
                     chosen = op.map(Option::getText).orElse(optId);
                 }
                 if (msgId != null) {
-                    String text = q.getText() + "\n\nОтвет: «" + chosen + "»";
-                    bot.execute(new EditMessageText(chatId, msgId, text)); // без клавиатуры
+                    String text = q.getText() + "\n\n<b>Ваш ответ:</b> " + chosen;
+                    bot.execute(new EditMessageText(chatId, msgId, text).parseMode(ParseMode.HTML));
                 }
                 // Записываем факт и двигаемся дальше через сервис
                 surveyService.handleCallback(uid, data);
@@ -274,7 +275,7 @@ public class Bot {
             }
 
             if ("m".equals(kind)) {
-                // Обрабатываем MULTI полностью здесь (UI под контролем)
+                // Обрабатываем MULTI
                 String optId = parts[3];
                 Map<String,Object> prog = db.loadProgress(uid);
                 if (prog == null) { bot.execute(new AnswerCallbackQuery(cb.id())); return; }
@@ -285,7 +286,6 @@ public class Bot {
 
                 int max = q.getMax();
                 if (selected.size() > max) {
-                    // не даём превысить
                     bot.execute(new AnswerCallbackQuery(cb.id()).text("Можно выбрать не более " + max));
                     return;
                 }
@@ -319,8 +319,8 @@ public class Bot {
 
                 // редактируем текущее сообщение — финальный вид, БЕЗ клавиатуры
                 if (msgId != null) {
-                    String finalText = q.getText() + "\n\nОтветы: " + String.join(", ", labels);
-                    bot.execute(new EditMessageText(chatId, msgId, finalText));
+                    String finalText = q.getText() + "\n\nВаши ответы: " + String.join(", ", labels);
+                    bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
                 }
 
                 // и отправляем следующий вопрос
@@ -339,7 +339,6 @@ public class Bot {
     /* ========================= helpers ========================= */
 
     private void resendCurrent(long chatId, long uid, Question q) {
-        // переотправляем текущий (если вдруг нет msg_id) или редактируем, если есть
         Integer msgId = db.getCurrentMessageId(uid);
         String text = buildQuestionText(q, uid);
         InlineKeyboardMarkup kb = Keyboards.forQuestion(q, surveyService.getMultiSelected(uid, q.getId()));
@@ -359,21 +358,20 @@ public class Bot {
         if (res != null && res.message()!=null) db.setCurrentMessageId(uid, res.message().messageId());
     }
 
-    /** Редактировать текущее сообщение в «Ответ: …» (без клавиатуры). */
+    /** Редактировать текущее сообщение в «Ваш ответ: …» (без клавиатуры). */
     private void editCurrentToAnswer(long chatId, long uid, Question q, String answerText) {
         Integer msgId = db.getCurrentMessageId(uid);
         if (msgId == null) return;
-        String text = q.getText() + "\n\nОтвет: «" + answerText + "»";
-        bot.execute(new EditMessageText(chatId, msgId, text));
+        String text = q.getText() + "\n\n<b>Ваш ответ:</b> " + answerText;
+        bot.execute(new EditMessageText(chatId, msgId, text).parseMode(ParseMode.HTML));
     }
 
-    /** Ветвь для текстового «Другое» на MULTI: добавить, перерисовать, либо финализировать при достижении max. */
+    /** Ветвь для текстового «своего варианта» на MULTI: добавить, перерисовать, либо финализировать при достижении max. */
     private void handleFreeTextForMulti(long chatId, long uid, Question q, String textInput) {
         Map<String,Object> prog = db.loadProgress(uid);
         if (prog == null) return;
-        @SuppressWarnings("unchecked")
         List<String> selected = new ArrayList<>(db.getMultiSelected(uid));
-        selected.add("Другое: " + textInput);
+        selected.add(textInput); // без префикса
         int max = q.getMax();
 
         Integer msgId = db.getCurrentMessageId(uid);
@@ -388,9 +386,8 @@ public class Bot {
             return;
         }
 
-        // reached max => финализируем
+        // reached max
         List<String> labels = selected.stream().map(s -> {
-            if (s.startsWith("Другое: ")) return s;
             Optional<Option> op = q.getOptions().stream().filter(o -> o.getId().equals(s)).findFirst();
             return op.map(Option::getText).orElse(s);
         }).collect(Collectors.toList());
