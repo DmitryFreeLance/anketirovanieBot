@@ -397,8 +397,8 @@ public class Bot {
         db.saveProgress(uid, (int)prog.get("current_q_index")+1, null, null, null);
 
         if (msgId != null) {
-            String finalText = q.getText() + "\n\nОтветы: " + String.join(", ", labels);
-            bot.execute(new EditMessageText(chatId, msgId, finalText));
+            String finalText = q.getText() + "\n\nВаши Ответы: " + String.join(", ", labels);
+            bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
         }
 
         Question next = surveyService.currentQuestion(uid);
