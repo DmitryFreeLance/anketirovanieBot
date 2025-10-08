@@ -16,38 +16,22 @@ public class Db {
     private final String url;
 
     public Db(String path) {
-        try {
-            Files.createDirectories(Path.of("data"));
-        } catch (Exception ignored) {}
+        try { Files.createDirectories(Path.of("data")); } catch (Exception ignored) {}
         this.url = "jdbc:sqlite:" + path; // обычно "data/survey.db"
     }
 
     private Connection connect() throws SQLException {
         Connection c = DriverManager.getConnection(url);
-        try (Statement s = c.createStatement()) {
-            s.execute("PRAGMA foreign_keys=ON;");
-        }
+        try (Statement s = c.createStatement()) { s.execute("PRAGMA foreign_keys=ON;"); }
         return c;
     }
 
-    /* ====== Инициализация схемы / миграции ====== */
+    /* =================== schema & perf =================== */
 
-    /** Старый метод, если у тебя есть resources/schema.sql — можно оставить. Не обязателен. */
-    public void init() throws Exception {
-        try (Connection c = connect()) {
-            String schema = new BufferedReader(new InputStreamReader(
-                    Objects.requireNonNull(getClass().getResourceAsStream("/schema.sql")))).lines()
-                    .reduce("", (a, b) -> a + "\n" + b);
-            try (Statement s = c.createStatement()) { s.executeUpdate(schema); }
-        }
-    }
-
-    /** Создаёт таблицы и недостающие колонки (idempotent). Зови при старте. */
     public void initSchema() {
         try (Connection c = connect(); Statement s = c.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON;");
 
-            // users
             s.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +44,6 @@ public class Db {
                 );
             """);
 
-            // responses
             s.execute("""
                 CREATE TABLE IF NOT EXISTS responses (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,26 +55,25 @@ public class Db {
                 );
             """);
 
-            // answers — ВАЖНО: используем question_id / answer_text / option_ids_json
             s.execute("""
                 CREATE TABLE IF NOT EXISTS answers (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   response_id INTEGER NOT NULL,
-                  question_id TEXT,          -- id вопроса (например "q7")
-                  answer_text TEXT,          -- одиночный ответ / рейтинг / свободный текст
-                  option_ids_json TEXT,      -- JSON-массив для MULTI (["A","B","Другое: ..."])
+                  question_id TEXT,
+                  answer_text TEXT,
+                  option_ids_json TEXT,
                   created_at TEXT,
                   FOREIGN KEY(response_id) REFERENCES responses(id)
                 );
             """);
 
-            // user_progress — храним состояние анкеты
             s.execute("""
                 CREATE TABLE IF NOT EXISTS user_progress (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER NOT NULL,
                   response_id INTEGER NOT NULL,
                   current_q_index INTEGER NOT NULL DEFAULT 0,
+                  current_msg_id INTEGER,
                   awaiting_other_question_id TEXT,
                   awaiting_other_option_id TEXT,
                   multi_selection_json TEXT,
@@ -101,7 +83,6 @@ public class Db {
                 );
             """);
 
-            // Миграции: добавить недостающие колонки (если таблицы уже были со старой схемой)
             ensureColumn(c, "users", "is_admin", "INTEGER DEFAULT 0");
             ensureColumn(c, "users", "created_at", "TEXT");
 
@@ -114,24 +95,20 @@ public class Db {
             ensureColumn(c, "answers", "created_at", "TEXT");
 
             ensureColumn(c, "user_progress", "current_q_index", "INTEGER");
+            ensureColumn(c, "user_progress", "current_msg_id", "INTEGER");
             ensureColumn(c, "user_progress", "awaiting_other_question_id", "TEXT");
             ensureColumn(c, "user_progress", "awaiting_other_option_id", "TEXT");
             ensureColumn(c, "user_progress", "multi_selection_json", "TEXT");
             ensureColumn(c, "user_progress", "updated_at", "TEXT");
 
-            // Индексы
             s.execute("CREATE INDEX IF NOT EXISTS idx_users_tg_id          ON users(tg_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_resp_user_status     ON responses(user_id, status, completed_at);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_resp         ON answers(response_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_qid          ON answers(question_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_progress_user        ON user_progress(user_id);");
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        } catch (Exception e) { e.printStackTrace(); }
     }
 
-    /** Включить WAL/таймауты/индексы. Зови при старте. */
     public void initPerformance() {
         try (Connection c = connect(); Statement s = c.createStatement()) {
             s.execute("PRAGMA journal_mode=WAL;");
@@ -144,30 +121,18 @@ public class Db {
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_resp         ON answers(response_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_qid          ON answers(question_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_progress_user        ON user_progress(user_id);");
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        } catch (Exception e) { e.printStackTrace(); }
     }
 
-    /** Добавляет колонку, если её нет. */
     private static void ensureColumn(Connection c, String table, String column, String declType) throws Exception {
         boolean exists = false;
-        try (PreparedStatement ps = c.prepareStatement("PRAGMA table_info(" + table + ")");
-             ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                if (column.equalsIgnoreCase(rs.getString("name"))) {
-                    exists = true; break;
-                }
-            }
+        try (PreparedStatement ps = c.prepareStatement("PRAGMA table_info(" + table + ")"); ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) if (column.equalsIgnoreCase(rs.getString("name"))) { exists = true; break; }
         }
-        if (!exists) {
-            try (Statement st = c.createStatement()) {
-                st.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + declType + ";");
-            }
-        }
+        if (!exists) try (Statement st = c.createStatement()) { st.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + declType + ";"); }
     }
 
-    /* ====== Пользователи и админы ====== */
+    /* =================== users/admin =================== */
 
     public void ensureUser(User u) {
         String sql = "INSERT INTO users(tg_id, first_name, last_name, username, created_at) " +
@@ -183,7 +148,6 @@ public class Db {
         } catch (SQLException e) { e.printStackTrace(); }
     }
 
-    /** Идемпотентно назначает администратора (используется для bootstrap-админа). */
     public void ensureAdmin(long tgId) {
         String sql = "INSERT INTO users(tg_id, created_at, is_admin) VALUES(?, ?, 1) " +
                 "ON CONFLICT(tg_id) DO UPDATE SET is_admin=1";
@@ -191,18 +155,14 @@ public class Db {
             ps.setLong(1, tgId);
             ps.setString(2, Instant.now().toString());
             ps.executeUpdate();
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
+        } catch (SQLException e) { e.printStackTrace(); }
     }
 
     public boolean isAdmin(long tgId) {
         String sql = "SELECT is_admin FROM users WHERE tg_id=?";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setLong(1, tgId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1) == 1;
-            }
+            try (ResultSet rs = ps.executeQuery()) { return rs.next() && rs.getInt(1) == 1; }
         } catch (SQLException e) { e.printStackTrace(); }
         return false;
     }
@@ -216,17 +176,13 @@ public class Db {
             ps.setString(2, Instant.now().toString());
             ps.executeUpdate();
             return "Пользователь " + targetTgId + " назначен администратором.";
-        } catch (SQLException e) {
-            e.printStackTrace();
-            return "Ошибка: " + e.getMessage();
-        }
+        } catch (SQLException e) { e.printStackTrace(); return "Ошибка: " + e.getMessage(); }
     }
 
-    /* ====== Состояние опроса ====== */
+    /* =================== survey progress =================== */
 
     public boolean hasCompleted(long tgId) {
-        String sql = "SELECT COUNT(*) FROM responses r JOIN users u ON u.id=r.user_id " +
-                "WHERE u.tg_id=? AND r.status='COMPLETED'";
+        String sql = "SELECT COUNT(*) FROM responses r JOIN users u ON u.id=r.user_id WHERE u.tg_id=? AND r.status='COMPLETED'";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setLong(1, tgId);
             try (ResultSet rs = ps.executeQuery()) { return rs.next() && rs.getInt(1) > 0; }
@@ -238,27 +194,24 @@ public class Db {
         String sqlUser = "SELECT id FROM users WHERE tg_id=?";
         String sqlResp = "INSERT INTO responses(user_id,status,started_at) VALUES(?, 'DRAFT', ?)";
         String sqlProgress = """
-            INSERT INTO user_progress(user_id,response_id,current_q_index,updated_at)
-            VALUES(?,?,0,?)
+            INSERT INTO user_progress(user_id,response_id,current_q_index,current_msg_id,updated_at)
+            VALUES(?,?,0,NULL,?)
             ON CONFLICT(user_id) DO UPDATE SET
               response_id=excluded.response_id,
               current_q_index=0,
+              current_msg_id=NULL,
               awaiting_other_question_id=NULL,
               awaiting_other_option_id=NULL,
               multi_selection_json=NULL,
               updated_at=?;
         """;
-
         try (Connection c = connect()) {
             c.setAutoCommit(false);
 
             long userId;
             try (PreparedStatement ps = c.prepareStatement(sqlUser)) {
                 ps.setLong(1, tgId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) { c.rollback(); return -1; }
-                    userId = rs.getLong(1);
-                }
+                try (ResultSet rs = ps.executeQuery()) { if (!rs.next()) { c.rollback(); return -1; } userId = rs.getLong(1); }
             }
 
             long respId;
@@ -266,17 +219,15 @@ public class Db {
                 ps.setLong(1, userId);
                 ps.setString(2, Instant.now().toString());
                 ps.executeUpdate();
-                try (ResultSet rs = ps.getGeneratedKeys()) {
-                    rs.next(); respId = rs.getLong(1);
-                }
+                try (ResultSet rs = ps.getGeneratedKeys()) { rs.next(); respId = rs.getLong(1); }
             }
 
             try (PreparedStatement ps = c.prepareStatement(sqlProgress)) {
                 String now = Instant.now().toString();
-                ps.setLong(1, userId);   // INSERT user_id
-                ps.setLong(2, respId);   // INSERT response_id
-                ps.setString(3, now);    // INSERT updated_at
-                ps.setString(4, now);    // UPDATE updated_at
+                ps.setLong(1, userId);
+                ps.setLong(2, respId);
+                ps.setString(3, now);
+                ps.setString(4, now);
                 ps.executeUpdate();
             }
 
@@ -286,9 +237,9 @@ public class Db {
         return -1;
     }
 
-    /** Загружает прогресс по пользователю. Ключи: current_q_index, awaiting_other_q, awaiting_other_o, multi_selection_json, response_id */
+    /** keys: current_q_index, current_msg_id, awaiting_other_q, awaiting_other_o, multi_selection_json, response_id */
     public Map<String,Object> loadProgress(long tgId) {
-        String sql = "SELECT p.current_q_index, p.awaiting_other_question_id, p.awaiting_other_option_id, p.multi_selection_json, p.response_id " +
+        String sql = "SELECT p.current_q_index, p.current_msg_id, p.awaiting_other_question_id, p.awaiting_other_option_id, p.multi_selection_json, p.response_id " +
                 "FROM user_progress p JOIN users u ON u.id=p.user_id WHERE u.tg_id=?";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setLong(1, tgId);
@@ -296,26 +247,25 @@ public class Db {
                 if (!rs.next()) return null;
                 Map<String,Object> map = new HashMap<>();
                 map.put("current_q_index", rs.getInt(1));
-                map.put("awaiting_other_q", rs.getString(2));
-                map.put("awaiting_other_o", rs.getString(3));
-                map.put("multi_selection_json", rs.getString(4));
-                map.put("response_id", rs.getLong(5));
+                map.put("current_msg_id", rs.getObject(2) == null ? null : rs.getInt(2));
+                map.put("awaiting_other_q", rs.getString(3));
+                map.put("awaiting_other_o", rs.getString(4));
+                map.put("multi_selection_json", rs.getString(5));
+                map.put("response_id", rs.getLong(6));
                 return map;
             }
         } catch (SQLException e) { e.printStackTrace(); }
         return null;
     }
 
-    /** Сохраняет прогресс на текущем вопросе. */
     public void saveProgress(long tgId, int currentIndex, String awaitingQ, String awaitingO, List<String> multi) {
-        String sql = "UPDATE user_progress SET current_q_index=?, awaiting_other_question_id=?, awaiting_other_option_id=?, multi_selection_json=?, updated_at=? " +
-                "WHERE user_id=(SELECT id FROM users WHERE tg_id=?)";
+        String sql = "UPDATE user_progress SET current_q_index=?, awaiting_other_question_id=?, awaiting_other_option_id=?, multi_selection_json=?, updated_at=? WHERE user_id=(SELECT id FROM users WHERE tg_id=?)";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setInt(1, currentIndex);
             ps.setString(2, awaitingQ);
             ps.setString(3, awaitingO);
             String json = null;
-            if (multi != null) json = new ObjectMapper().writeValueAsString(multi);
+            if (multi != null) json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(multi);
             ps.setString(4, json);
             ps.setString(5, Instant.now().toString());
             ps.setLong(6, tgId);
@@ -323,7 +273,25 @@ public class Db {
         } catch (Exception e) { e.printStackTrace(); }
     }
 
-    /** Читает временные выбранные значения MULTI из прогресса. */
+    public void setCurrentMessageId(long tgId, Integer msgId) {
+        String sql = "UPDATE user_progress SET current_msg_id=?, updated_at=? WHERE user_id=(SELECT id FROM users WHERE tg_id=?)";
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
+            if (msgId == null) ps.setNull(1, Types.INTEGER); else ps.setInt(1, msgId);
+            ps.setString(2, Instant.now().toString());
+            ps.setLong(3, tgId);
+            ps.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+
+    public Integer getCurrentMessageId(long tgId) {
+        String sql = "SELECT current_msg_id FROM user_progress p JOIN users u ON u.id=p.user_id WHERE u.tg_id=?";
+        try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setLong(1, tgId);
+            try (ResultSet rs = ps.executeQuery()) { if (rs.next()) return (Integer) rs.getObject(1); }
+        } catch (SQLException e) { e.printStackTrace(); }
+        return null;
+    }
+
     public List<String> getMultiSelected(long tgId) {
         String sql = "SELECT multi_selection_json FROM user_progress p JOIN users u ON u.id=p.user_id WHERE u.tg_id=?";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
@@ -332,7 +300,7 @@ public class Db {
                 if (!rs.next()) return new ArrayList<>();
                 String json = rs.getString(1);
                 if (json == null) return new ArrayList<>();
-                return new ObjectMapper().readValue(json, new TypeReference<List<String>>() {});
+                return new com.fasterxml.jackson.databind.ObjectMapper().readValue(json, new TypeReference<List<String>>() {});
             }
         } catch (Exception e) { e.printStackTrace(); }
         return new ArrayList<>();
@@ -347,7 +315,6 @@ public class Db {
         return -1;
     }
 
-    /** Записывает ответ: SINGLE/RATING в answer_text, MULTI — в option_ids_json (список меток). */
     public void insertAnswer(long responseId, String questionId, String answerText, List<String> multiOptions) {
         String sql = "INSERT INTO answers(response_id,question_id,answer_text,option_ids_json,created_at) VALUES(?,?,?,?,?)";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
@@ -355,14 +322,13 @@ public class Db {
             ps.setString(2, questionId);
             ps.setString(3, answerText);
             String json = null;
-            if (multiOptions != null) json = new ObjectMapper().writeValueAsString(multiOptions);
+            if (multiOptions != null) json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(multiOptions);
             ps.setString(4, json);
             ps.setString(5, Instant.now().toString());
             ps.executeUpdate();
         } catch (Exception e) { e.printStackTrace(); }
     }
 
-    /** Завершает анкету и очищает прогресс. */
     public void finishAndCommit(long tgId) {
         String sql = """
             UPDATE responses SET status='COMPLETED', completed_at=? 
@@ -384,7 +350,6 @@ public class Db {
         } catch (SQLException e) { e.printStackTrace(); }
     }
 
-    /** Есть ли незавершённая анкета у пользователя. */
     public boolean inDraft(long tgId) {
         String sql = "SELECT COUNT(*) FROM user_progress p JOIN users u ON u.id=p.user_id WHERE u.tg_id=?";
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
@@ -394,20 +359,15 @@ public class Db {
         return false;
     }
 
-    /* ====== Админ-запросы ====== */
+    /* =================== admin helpers =================== */
 
-    /** Количество завершённых анкет. */
     public int countCompleted() {
         String sql = "SELECT COUNT(*) FROM responses WHERE status='COMPLETED';";
         try (Connection c = connect(); Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             return rs.next() ? rs.getInt(1) : 0;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return 0;
-        }
+        } catch (Exception e) { e.printStackTrace(); return 0; }
     }
 
-    /** Все завершившие — для пагинации. */
     public List<Long> listCompletedUserTgIdsPaged(int limit, int offset) {
         List<Long> out = new ArrayList<>();
         String sql = """
@@ -421,16 +381,11 @@ public class Db {
         try (Connection c = connect(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setInt(1, limit);
             ps.setInt(2, offset);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) out.add(rs.getLong(1));
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) out.add(rs.getLong(1)); }
+        } catch (Exception e) { e.printStackTrace(); }
         return out;
     }
 
-    /** Все завершившие — без пагинации (если нужно). */
     public List<Long> listCompletedUserTgIds() {
         String sql = """
             SELECT DISTINCT u.tg_id
@@ -445,7 +400,6 @@ public class Db {
         return out;
     }
 
-    /** Ответы конкретного пользователя (для /user <id>). */
     public Map<String,List<String>> getUserAnswers(long tgId) {
         String sql = """
           SELECT a.question_id, COALESCE(a.answer_text, a.option_ids_json)
@@ -469,10 +423,6 @@ public class Db {
         return map;
     }
 
-    /**
-     * Для общей статистики: возвращает все ответы по завершённым анкетам.
-     * Ключи в map: "tgId", "q", "text", "json" — согласованы с AdminService.
-     */
     public List<Map<String, Object>> getAllCompletedAnswers() {
         String sql = """
           SELECT u.tg_id, a.question_id, a.answer_text, a.option_ids_json
