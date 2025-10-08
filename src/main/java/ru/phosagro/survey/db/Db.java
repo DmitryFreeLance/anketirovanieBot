@@ -32,57 +32,59 @@ public class Db {
         try (Connection c = connect(); Statement s = c.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON;");
 
+            // --- tables ---
             s.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  tg_id INTEGER UNIQUE NOT NULL,
-                  first_name TEXT,
-                  last_name TEXT,
-                  username TEXT,
-                  is_admin INTEGER DEFAULT 0,
-                  created_at TEXT
-                );
-            """);
+            CREATE TABLE IF NOT EXISTS users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              tg_id INTEGER UNIQUE NOT NULL,
+              first_name TEXT,
+              last_name TEXT,
+              username TEXT,
+              is_admin INTEGER DEFAULT 0,
+              created_at TEXT
+            );
+        """);
 
             s.execute("""
-                CREATE TABLE IF NOT EXISTS responses (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  status TEXT NOT NULL DEFAULT 'DRAFT',
-                  started_at TEXT,
-                  completed_at TEXT,
-                  FOREIGN KEY(user_id) REFERENCES users(id)
-                );
-            """);
+            CREATE TABLE IF NOT EXISTS responses (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'DRAFT',
+              started_at TEXT,
+              completed_at TEXT,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+        """);
 
             s.execute("""
-                CREATE TABLE IF NOT EXISTS answers (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  response_id INTEGER NOT NULL,
-                  question_id TEXT,
-                  answer_text TEXT,
-                  option_ids_json TEXT,
-                  created_at TEXT,
-                  FOREIGN KEY(response_id) REFERENCES responses(id)
-                );
-            """);
+            CREATE TABLE IF NOT EXISTS answers (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              response_id INTEGER NOT NULL,
+              question_id TEXT,
+              answer_text TEXT,
+              option_ids_json TEXT,
+              created_at TEXT,
+              FOREIGN KEY(response_id) REFERENCES responses(id)
+            );
+        """);
 
             s.execute("""
-                CREATE TABLE IF NOT EXISTS user_progress (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  response_id INTEGER NOT NULL,
-                  current_q_index INTEGER NOT NULL DEFAULT 0,
-                  current_msg_id INTEGER,
-                  awaiting_other_question_id TEXT,
-                  awaiting_other_option_id TEXT,
-                  multi_selection_json TEXT,
-                  updated_at TEXT,
-                  FOREIGN KEY(user_id) REFERENCES users(id),
-                  FOREIGN KEY(response_id) REFERENCES responses(id)
-                );
-            """);
+            CREATE TABLE IF NOT EXISTS user_progress (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              response_id INTEGER NOT NULL,
+              current_q_index INTEGER NOT NULL DEFAULT 0,
+              current_msg_id INTEGER,
+              awaiting_other_question_id TEXT,
+              awaiting_other_option_id TEXT,
+              multi_selection_json TEXT,
+              updated_at TEXT,
+              FOREIGN KEY(user_id) REFERENCES users(id),
+              FOREIGN KEY(response_id) REFERENCES responses(id)
+            );
+        """);
 
+            // --- add missing columns (idempotent) ---
             ensureColumn(c, "users", "is_admin", "INTEGER DEFAULT 0");
             ensureColumn(c, "users", "created_at", "TEXT");
 
@@ -101,12 +103,32 @@ public class Db {
             ensureColumn(c, "user_progress", "multi_selection_json", "TEXT");
             ensureColumn(c, "user_progress", "updated_at", "TEXT");
 
+            // --- обычные индексы ---
             s.execute("CREATE INDEX IF NOT EXISTS idx_users_tg_id          ON users(tg_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_resp_user_status     ON responses(user_id, status, completed_at);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_resp         ON answers(response_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_answers_qid          ON answers(question_id);");
             s.execute("CREATE INDEX IF NOT EXISTS idx_progress_user        ON user_progress(user_id);");
-        } catch (Exception e) { e.printStackTrace(); }
+
+            // --- ДЕДУП перед созданием UNIQUE индекса на user_progress(user_id) ---
+            // Оставляем по одному (с минимальным id) на каждого user_id:
+            try (Statement dedup = c.createStatement()) {
+                dedup.execute("""
+                DELETE FROM user_progress
+                WHERE id NOT IN (
+                  SELECT MIN(id) FROM user_progress GROUP BY user_id
+                );
+            """);
+            } catch (Exception ignore) {
+                // если таблица пуста/нет дубликатов — всё ок
+            }
+
+            // --- Уникальный индекс для корректной работы ON CONFLICT(user_id) ---
+            s.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_progress_user ON user_progress(user_id);");
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     public void initPerformance() {
