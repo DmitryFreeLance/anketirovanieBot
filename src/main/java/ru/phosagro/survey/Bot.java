@@ -319,7 +319,7 @@ public class Bot {
 
                 // редактируем текущее сообщение — финальный вид, БЕЗ клавиатуры
                 if (msgId != null) {
-                    String finalText = q.getText() + "\n\nВаши ответы: " + String.join(", ", labels);
+                    String finalText = q.getText() + "\n\n<b>Ваши ответы:</b> " + String.join(", ", labels);
                     bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
                 }
 
@@ -397,7 +397,7 @@ public class Bot {
         db.saveProgress(uid, (int)prog.get("current_q_index")+1, null, null, null);
 
         if (msgId != null) {
-            String finalText = q.getText() + "\n\nВаши Ответы: " + String.join(", ", labels);
+            String finalText = q.getText() + "\n\n<b>Ваши Ответы:</b> " + String.join(", ", labels);
             bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
         }
 
