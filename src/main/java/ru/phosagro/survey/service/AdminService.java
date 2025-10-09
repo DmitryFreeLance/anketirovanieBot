@@ -173,7 +173,9 @@ public class AdminService {
                     }
                 }
 
-                for (int col=0; col<=2; col++) sh.autoSizeColumn(col);
+                for (int col = 0; col <= 2; col++) {
+                    sh.setColumnWidth(col, 20 * 256); // ширина ~20 символов
+                }
             }
 
             // в байты
