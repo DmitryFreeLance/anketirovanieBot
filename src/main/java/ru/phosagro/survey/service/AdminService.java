@@ -63,8 +63,22 @@ public class AdminService {
             summary.autoSizeColumn(0); summary.autoSizeColumn(1);
 
             // По одному листу на вопрос
-            for (Question q : survey.getQuestions()) {
-                Sheet sh = wb.createSheet(cleanSheetName(q.getText()));
+            for (int qi = 0; qi < survey.getQuestions().size(); qi++) {
+                Question q = survey.getQuestions().get(qi);
+
+                // Сформируем уникальное имя листа, безопасное и в пределах 31 символа
+                String base = cleanSheetName(q.getText()); // уже отрезает до 28 максимум
+                String sheetName = base;
+                int suffix = 1;
+                // если имя уже существует в книге, добавляем суффикс _1, _2 и т.д.
+                while (wb.getSheet(sheetName) != null) {
+                    String suffixStr = "_" + suffix++;
+                    int maxBaseLen = 31 - suffixStr.length();
+                    String trimmedBase = base.length() > maxBaseLen ? base.substring(0, maxBaseLen) : base;
+                    sheetName = trimmedBase + suffixStr;
+                }
+
+                Sheet sh = wb.createSheet(sheetName);
                 int rowIdx = 0;
 
                 // заголовок
@@ -84,7 +98,6 @@ public class AdminService {
                     // для текстовых — выводим просто список ответов
                     h.getCell(1).setCellValue("Ответ"); // переименуем
                     h.getCell(2).setCellValue("");      // пусто
-                    // пробежимся
                     for (var m : rows) {
                         if (!q.getId().equals((String)m.get("q"))) continue;
                         String txt = (String)m.get("text");
@@ -113,11 +126,9 @@ public class AdminService {
                 } else {
                     // SINGLE / MULTI
                     Map<String,Integer> cnt = new LinkedHashMap<>();
-                    // инициализируем известные опции
                     for (Option o : q.getOptions()) {
                         if (!o.isOther()) cnt.put(o.getText(), 0);
                     }
-                    // «другие» собираем отдельно
                     Map<String,Integer> other = new LinkedHashMap<>();
 
                     if (q.getType() == QuestionType.SINGLE) {
@@ -173,7 +184,15 @@ public class AdminService {
                     }
                 }
 
-                for (int col=0; col<=2; col++) sh.autoSizeColumn(col);
+                // Безопасное авто-выравнивание/ширина: autoSize может падать в headless/без шрифтов,
+                // поэтому пробуем и в случае ошибки ставим фиксированную ширину.
+                for (int col = 0; col <= 2; col++) {
+                    try {
+                        sh.autoSizeColumn(col);
+                    } catch (Throwable th) {
+                        try { sh.setColumnWidth(col, 20 * 256); } catch (Throwable ignore) {}
+                    }
+                }
             }
 
             // в байты
