@@ -23,7 +23,8 @@ public class Keyboards {
     public static InlineKeyboardMarkup adminMenu() {
         return new InlineKeyboardMarkup(
                 new InlineKeyboardButton("🔢 Общая статистика").callbackData("admin:stats"),
-                new InlineKeyboardButton("👥 Пользователи").callbackData("admin:users")
+                new InlineKeyboardButton("👥 Пользователи").callbackData("admin:users"),
+                new InlineKeyboardButton("📊 Excel-статистика").callbackData("admin:export")
         );
     }
 

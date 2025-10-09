@@ -5,6 +5,7 @@ import com.pengrad.telegrambot.TelegramBot;
 import com.pengrad.telegrambot.UpdatesListener;
 import com.pengrad.telegrambot.model.*;
 import com.pengrad.telegrambot.model.request.InlineKeyboardMarkup;
+import com.pengrad.telegrambot.model.request.InputFile;
 import com.pengrad.telegrambot.model.request.ParseMode;
 import com.pengrad.telegrambot.request.*;
 import ru.phosagro.survey.db.Db;
@@ -16,6 +17,7 @@ import ru.phosagro.survey.service.AdminService;
 import ru.phosagro.survey.service.SurveyService;
 import ru.phosagro.survey.util.Keyboards;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -170,10 +172,13 @@ public class Bot {
         long chatId = cb.message().chat().id();
         long uid = cb.from().id();
         String data = cb.data();
-        if (data == null) return;
+        if (data == null) {
+            bot.execute(new AnswerCallbackQuery(cb.id()));
+            return;
+        }
 
-        // старт
-        if (data.equals("start")) {
+        // ==== Старт анкеты ====
+        if ("start".equals(data)) {
             if (surveyService.userCompleted(uid)) {
                 bot.execute(new SendMessage(chatId, "Вы уже проходили анкетирование. Спасибо!"));
                 bot.execute(new AnswerCallbackQuery(cb.id()));
@@ -186,14 +191,18 @@ public class Bot {
             return;
         }
 
-        // ===== ADMIN =====
+        // ==== АДМИН ====
         if (data.startsWith("admin:")) {
+
+            // Вернуться в админ-панель
             if ("admin:menu".equals(data)) {
                 String res = adminService.openAdminPanel(uid);
                 bot.execute(new SendMessage(chatId, res).replyMarkup(Keyboards.adminMenu()));
                 bot.execute(new AnswerCallbackQuery(cb.id()));
                 return;
             }
+
+            // Общая статистика (постранично: 0 — "Завершили опрос", дальше — вопросы)
             if ("admin:stats".equals(data)) {
                 int totalPages = adminService.statsTotalPages();
                 String page0 = adminService.buildStatsPage(0);
@@ -205,6 +214,8 @@ public class Bot {
                 bot.execute(new AnswerCallbackQuery(cb.id()));
                 return;
             }
+
+            // Следующая страница статистики
             if (data.startsWith("admin:stats:next:")) {
                 try {
                     int pageIndex = Integer.parseInt(data.substring("admin:stats:next:".length()));
@@ -217,11 +228,15 @@ public class Bot {
                 bot.execute(new AnswerCallbackQuery(cb.id()));
                 return;
             }
+
+            // Пользователи: страница 1
             if ("admin:users".equals(data)) {
                 sendUsersPage(chatId, 0);
                 bot.execute(new AnswerCallbackQuery(cb.id()));
                 return;
             }
+
+            // Пользователи: следующая страница
             if (data.startsWith("admin:users:page:")) {
                 try {
                     int idx = Integer.parseInt(data.substring("admin:users:page:".length()));
@@ -230,7 +245,41 @@ public class Bot {
                 bot.execute(new AnswerCallbackQuery(cb.id()));
                 return;
             }
-            // fallback
+
+            // Экспорт Excel со всей общей статистикой
+            if ("admin:export".equals(data)) {
+                if (!db.isAdmin(uid)) {
+                    bot.execute(new AnswerCallbackQuery(cb.id()).text("Доступ запрещён."));
+                    return;
+                }
+                byte[] xlsx = adminService.exportStatsXlsx();
+                if (xlsx == null || xlsx.length == 0) {
+                    bot.execute(new SendMessage(chatId, "Не удалось сформировать Excel."));
+                } else {
+                    java.io.File tmp = null;
+                    try {
+                        tmp = java.io.File.createTempFile("fosagro_stats_", ".xlsx");
+                        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
+                            fos.write(xlsx);
+                        }
+                        // Отправляем как файл
+                        SendDocument doc = new SendDocument(chatId, tmp);
+                        bot.execute(doc);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        bot.execute(new SendMessage(chatId, "Ошибка при отправке Excel: " + e.getMessage()));
+                    } finally {
+                        if (tmp != null) {
+                            // Пытаемся удалить временный файл
+                            try { if (!tmp.delete()) tmp.deleteOnExit(); } catch (Exception ignored) {}
+                        }
+                    }
+                }
+                bot.execute(new AnswerCallbackQuery(cb.id()));
+                return;
+            }
+
+            // Фоллбек для прочих admin:* (если есть)
             String res = adminService.handleAdminCallback(uid, data);
             if (res != null && !res.isBlank() && !"__MULTI__".equals(res) && !"__USERS__".equals(res)) {
                 bot.execute(new SendMessage(chatId, res).replyMarkup(Keyboards.adminMenu()));
@@ -239,33 +288,43 @@ public class Bot {
             return;
         }
 
-        // ===== SURVEY =====
+        // ==== АНКЕТА ====
         if (data.startsWith("ans:")) {
             String[] parts = data.split(":");
-            if (parts.length < 3) { bot.execute(new AnswerCallbackQuery(cb.id())); return; }
+            if (parts.length < 3) {
+                bot.execute(new AnswerCallbackQuery(cb.id()));
+                return;
+            }
             String qId = parts[1];
             String kind = parts[2];
 
             Question q = findQuestionById(qId);
-            if (q == null) { bot.execute(new AnswerCallbackQuery(cb.id())); return; }
+            if (q == null) {
+                bot.execute(new AnswerCallbackQuery(cb.id()));
+                return;
+            }
 
+            // SINGLE или RATING: редактируем сообщение → "Ваш ответ: <b>...</b>", фиксируем, показываем следующий вопрос
             if ("s".equals(kind) || "r".equals(kind)) {
-                // Сначала редактируем текущее сообщение на "Ваш ответ: ..."
                 Integer msgId = db.getCurrentMessageId(uid);
                 String chosen;
-                if ("r".equals(kind)) chosen = parts[3];
-                else {
+                if ("r".equals(kind)) {
+                    chosen = parts[3];
+                } else {
                     String optId = parts[3];
                     Optional<Option> op = q.getOptions().stream().filter(o -> o.getId().equals(optId)).findFirst();
                     chosen = op.map(Option::getText).orElse(optId);
                 }
+
                 if (msgId != null) {
-                    String text = q.getText() + "\n\n<b>Ваш ответ:</b> " + chosen;
-                    bot.execute(new EditMessageText(chatId, msgId, text).parseMode(ParseMode.HTML));
+                    String txt = escapeHtml(q.getText()) + "\n\n<b>Ваш ответ:</b> <b>" + escapeHtml(chosen) + "</b>";
+                    bot.execute(new EditMessageText(chatId, msgId, txt).parseMode(ParseMode.HTML));
                 }
-                // Записываем факт и двигаемся дальше через сервис
+
+                // Бизнес-логика
                 surveyService.handleCallback(uid, data);
-                // Показ следующего
+
+                // Следующий вопрос (или завершение)
                 Question next = surveyService.currentQuestion(uid);
                 if (next != null) sendNewQuestion(chatId, uid, next);
                 else if (surveyService.isCompleted(uid)) bot.execute(new SendMessage(chatId, survey.getFinish()));
@@ -274,12 +333,14 @@ public class Bot {
                 return;
             }
 
+            // MULTI: тумблер опции с подсветкой выбранных.
             if ("m".equals(kind)) {
-                // Обрабатываем MULTI
                 String optId = parts[3];
                 Map<String,Object> prog = db.loadProgress(uid);
-                if (prog == null) { bot.execute(new AnswerCallbackQuery(cb.id())); return; }
-                @SuppressWarnings("unchecked")
+                if (prog == null) {
+                    bot.execute(new AnswerCallbackQuery(cb.id()));
+                    return;
+                }
                 List<String> selected = new ArrayList<>(db.getMultiSelected(uid));
                 boolean wasSelected = selected.contains(optId);
                 if (wasSelected) selected.remove(optId); else selected.add(optId);
@@ -292,12 +353,13 @@ public class Bot {
 
                 Integer msgId = db.getCurrentMessageId(uid);
 
+                // Пока не достигли max — просто сохраняем и перерисовываем то же сообщение
                 if (selected.size() < max) {
-                    // промежуточное состояние — сохраняем прогресс и редактируем это же сообщение
                     db.saveProgress(uid, (int)prog.get("current_q_index"), null, null, selected);
-                    String newText = buildMultiText(q, uid);
                     if (msgId != null) {
+                        String newText = buildQuestionText(q, uid); // уже HTML + "Ваши ответы:"
                         EditMessageText emt = new EditMessageText(chatId, msgId, newText)
+                                .parseMode(ParseMode.HTML)
                                 .replyMarkup(Keyboards.forQuestion(q, surveyService.getMultiSelected(uid, q.getId())));
                         bot.execute(emt);
                     }
@@ -305,25 +367,23 @@ public class Bot {
                     return;
                 }
 
-                // == достигли max ==
-                // финальный список (преобразуем id → текст)
+                // Достигли max: фиксируем ответы, двигаем индекс
                 List<String> labels = selected.stream().map(s -> {
                     Optional<Option> op = q.getOptions().stream().filter(o -> o.getId().equals(s)).findFirst();
                     return op.map(Option::getText).orElse(s);
-                }).collect(Collectors.toList());
+                }).collect(java.util.stream.Collectors.toList());
 
-                // фиксируем ответ в БД и двигаем индекс
                 long respId = (long) prog.get("response_id");
                 db.insertAnswer(respId, q.getId(), null, labels);
                 db.saveProgress(uid, (int)prog.get("current_q_index")+1, null, null, null);
 
-                // редактируем текущее сообщение — финальный вид, БЕЗ клавиатуры
+                // Перерисуем текущее сообщение финальным видом
                 if (msgId != null) {
-                    String finalText = q.getText() + "\n\n<b>Ваши ответы:</b> " + String.join(", ", labels);
+                    String finalText = escapeHtml(q.getText()) + "\n\n<b>Ваши ответы:</b> " + boldJoin(labels);
                     bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
                 }
 
-                // и отправляем следующий вопрос
+                // Следующий вопрос (или конец)
                 Question next = surveyService.currentQuestion(uid);
                 if (next != null) sendNewQuestion(chatId, uid, next);
                 else if (surveyService.isCompleted(uid)) bot.execute(new SendMessage(chatId, survey.getFinish()));
@@ -333,6 +393,7 @@ public class Bot {
             }
         }
 
+        // по умолчанию — просто ACK
         bot.execute(new AnswerCallbackQuery(cb.id()));
     }
 
@@ -343,9 +404,9 @@ public class Bot {
         String text = buildQuestionText(q, uid);
         InlineKeyboardMarkup kb = Keyboards.forQuestion(q, surveyService.getMultiSelected(uid, q.getId()));
         if (msgId != null) {
-            bot.execute(new EditMessageText(chatId, msgId, text).replyMarkup(kb));
+            bot.execute(new EditMessageText(chatId, msgId, text).parseMode(ParseMode.HTML).replyMarkup(kb));
         } else {
-            var res = bot.execute(new SendMessage(chatId, text).replyMarkup(kb));
+            var res = bot.execute(new SendMessage(chatId, text).parseMode(ParseMode.HTML).replyMarkup(kb));
             if (res != null && res.message()!=null) db.setCurrentMessageId(uid, res.message().messageId());
         }
     }
@@ -354,7 +415,7 @@ public class Bot {
     private void sendNewQuestion(long chatId, long uid, Question q) {
         String text = buildQuestionText(q, uid);
         InlineKeyboardMarkup kb = Keyboards.forQuestion(q, surveyService.getMultiSelected(uid, q.getId()));
-        var res = bot.execute(new SendMessage(chatId, text).replyMarkup(kb));
+        var res = bot.execute(new SendMessage(chatId, text).parseMode(ParseMode.HTML).replyMarkup(kb));
         if (res != null && res.message()!=null) db.setCurrentMessageId(uid, res.message().messageId());
     }
 
@@ -362,7 +423,7 @@ public class Bot {
     private void editCurrentToAnswer(long chatId, long uid, Question q, String answerText) {
         Integer msgId = db.getCurrentMessageId(uid);
         if (msgId == null) return;
-        String text = q.getText() + "\n\n<b>Ваш ответ:</b> " + answerText;
+        String text = escapeHtml(q.getText()) + "\n\n<b>Ваш ответ:</b> <b>" + escapeHtml(answerText) + "</b>";
         bot.execute(new EditMessageText(chatId, msgId, text).parseMode(ParseMode.HTML));
     }
 
@@ -381,6 +442,7 @@ public class Bot {
             if (msgId != null) {
                 String newText = buildMultiText(q, uid);
                 bot.execute(new EditMessageText(chatId, msgId, newText)
+                        .parseMode(ParseMode.HTML)
                         .replyMarkup(Keyboards.forQuestion(q, surveyService.getMultiSelected(uid, q.getId()))));
             }
             return;
@@ -397,7 +459,7 @@ public class Bot {
         db.saveProgress(uid, (int)prog.get("current_q_index")+1, null, null, null);
 
         if (msgId != null) {
-            String finalText = q.getText() + "\n\n<b>Ваши Ответы:</b> " + String.join(", ", labels);
+            String finalText = escapeHtml(q.getText()) + "\n\n<b>Ваши ответы:</b> " + boldJoin(labels);
             bot.execute(new EditMessageText(chatId, msgId, finalText).parseMode(ParseMode.HTML));
         }
 
@@ -408,7 +470,7 @@ public class Bot {
 
     /** Текст вопроса с подсказкой и счётчиком/списком для MULTI. */
     private String buildQuestionText(Question q, long uid) {
-        StringBuilder sb = new StringBuilder(q.getText());
+        StringBuilder sb = new StringBuilder(escapeHtml(q.getText()));
         boolean hasOther = q.getOptions()!=null && q.getOptions().stream().anyMatch(Option::isOther);
         if (hasOther) sb.append("\n\nМожете написать свой вариант ответа в чат.");
 
@@ -416,7 +478,9 @@ public class Bot {
             sb.append("\n\nВыбрано: ")
                     .append(surveyService.getMultiSelected(uid, q.getId()).size())
                     .append(" / ").append(q.getMax());
-            sb.append("\n").append(SurveyService.renderSelectedList(q, surveyService.getMultiSelected(uid, q.getId())));
+            // HTML из renderSelectedList
+            String selectedHtml = SurveyService.renderSelectedList(q, surveyService.getMultiSelected(uid, q.getId()));
+            sb.append("\n").append(selectedHtml);
         }
         return sb.toString();
     }
@@ -442,7 +506,7 @@ public class Bot {
         StringBuilder sb = new StringBuilder("Пользователи (страница ").append(pageIndex + 1).append("):\n");
         for (Long id : users) sb.append("• ").append(id).append("  (/user ").append(id).append(")\n");
         if (users.size() >= 10)
-            bot.execute(new SendMessage(chatId, sb.toString()).replyMarkup(ru.phosagro.survey.util.Keyboards.adminUsersNext(pageIndex + 1)));
+            bot.execute(new SendMessage(chatId, sb.toString()).replyMarkup(Keyboards.adminUsersNext(pageIndex + 1)));
         else
             bot.execute(new SendMessage(chatId, sb.toString()));
     }
@@ -451,10 +515,11 @@ public class Bot {
         List<String> chunks = splitBySize(fullText, 3800);
         for (int i = 0; i < chunks.size(); i++) {
             boolean last = (i == chunks.size() - 1);
-            if (last) bot.execute(new SendMessage(chatId, chunks.get(i)).replyMarkup(ru.phosagro.survey.util.Keyboards.adminStatsNav(pageIndex, totalPages)));
+            if (last) bot.execute(new SendMessage(chatId, chunks.get(i)).replyMarkup(Keyboards.adminStatsNav(pageIndex, totalPages)));
             else bot.execute(new SendMessage(chatId, chunks.get(i)));
         }
     }
+
     private static List<String> splitBySize(String text, int maxChars) {
         if (text == null) return List.of("");
         if (text.length() <= maxChars) return List.of(text);
@@ -468,5 +533,21 @@ public class Bot {
         }
         if (cur.length() > 0) out.add(cur.toString());
         return out;
+    }
+
+    /* ====== small HTML helpers ====== */
+
+    private static String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;");
+    }
+
+    private static String boldJoin(java.util.List<String> items) {
+        return items.stream()
+                .map(Bot::escapeHtml)
+                .map(t -> "<b>" + t + "</b>")
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 }
