@@ -54,50 +54,34 @@ public class AdminService {
             CellStyle percent = wb.createCellStyle();
             percent.setDataFormat(wb.createDataFormat().getFormat("0%"));
 
-            // Summary
+            // Summary (как и раньше)
             Sheet summary = wb.createSheet("Summary");
             Row r0 = summary.createRow(0);
             r0.createCell(0).setCellValue("Завершили опрос");
             Cell c1 = r0.createCell(1); c1.setCellValue(completed);
             r0.getCell(0).setCellStyle(header);
-            summary.autoSizeColumn(0); summary.autoSizeColumn(1);
+            // Попытка автоподбора, защищаемся
+            try { summary.autoSizeColumn(0); summary.autoSizeColumn(1); } catch (Throwable ignore) { summary.setColumnWidth(0, 30*256); summary.setColumnWidth(1, 12*256); }
 
-            // По одному листу на вопрос
-            for (int qi = 0; qi < survey.getQuestions().size(); qi++) {
-                Question q = survey.getQuestions().get(qi);
+            // Один лист для всех вопросов
+            Sheet sh = wb.createSheet("Survey");
+            int rowIdx = 0;
 
-                // Сформируем уникальное имя листа, безопасное и в пределах 31 символа
-                String base = cleanSheetName(q.getText()); // уже отрезает до 28 максимум
-                String sheetName = base;
-                int suffix = 1;
-                // если имя уже существует в книге, добавляем суффикс _1, _2 и т.д.
-                while (wb.getSheet(sheetName) != null) {
-                    String suffixStr = "_" + suffix++;
-                    int maxBaseLen = 31 - suffixStr.length();
-                    String trimmedBase = base.length() > maxBaseLen ? base.substring(0, maxBaseLen) : base;
-                    sheetName = trimmedBase + suffixStr;
-                }
+            for (Question q : survey.getQuestions()) {
+                // Заголовок вопроса
+                Row tq = sh.createRow(rowIdx++);
+                Cell tqc = tq.createCell(0);
+                tqc.setCellValue(q.getText());
+                tqc.setCellStyle(header);
 
-                Sheet sh = wb.createSheet(sheetName);
-                int rowIdx = 0;
-
-                // заголовок
-                Row t = sh.createRow(rowIdx++);
-                Cell tq = t.createCell(0); tq.setCellValue(q.getText()); tq.setCellStyle(header);
-
-                // шапка таблицы
+                // Шапка таблицы для вариантов
                 Row h = sh.createRow(rowIdx++);
-                Cell h1 = h.createCell(0); h1.setCellValue("Вариант");
-                h1.setCellStyle(header);
-                Cell h2 = h.createCell(1); h2.setCellValue("Кол-во");
-                h2.setCellStyle(header);
-                Cell h3 = h.createCell(2); h3.setCellValue("%");
-                h3.setCellStyle(header);
+                Cell h1 = h.createCell(0); h1.setCellValue("Вариант"); h1.setCellStyle(header);
+                Cell h2 = h.createCell(1); h2.setCellValue("Кол-во"); h2.setCellStyle(header);
+                Cell h3 = h.createCell(2); h3.setCellValue("%"); h3.setCellStyle(header);
 
                 if (q.getType() == QuestionType.TEXT) {
-                    // для текстовых — выводим просто список ответов
-                    h.getCell(1).setCellValue("Ответ"); // переименуем
-                    h.getCell(2).setCellValue("");      // пусто
+                    // выводим текстовые ответы по строчно
                     for (var m : rows) {
                         if (!q.getId().equals((String)m.get("q"))) continue;
                         String txt = (String)m.get("text");
@@ -109,27 +93,22 @@ public class AdminService {
                     for (int v=1; v<=10; v++) cnt.put(v, 0);
                     for (var m : rows) {
                         if (!q.getId().equals((String)m.get("q"))) continue;
-                        try {
-                            int v = Integer.parseInt((String)m.get("text"));
-                            cnt.merge(v, 1, Integer::sum);
-                        } catch (Exception ignored) {}
+                        try { int v = Integer.parseInt((String)m.get("text")); cnt.merge(v, 1, Integer::sum); }
+                        catch (Exception ignored) {}
                     }
                     for (int v=1; v<=10; v++) {
-                        int c = cnt.getOrDefault(v,0);
+                        int c = cnt.getOrDefault(v, 0);
                         Row r = sh.createRow(rowIdx++);
                         r.createCell(0).setCellValue(String.valueOf(v));
                         r.createCell(1).setCellValue(c);
                         Cell pc = r.createCell(2);
-                        pc.setCellValue(completed == 0 ? 0.0 : (c*1.0/completed));
+                        pc.setCellValue(completed == 0 ? 0.0 : (c * 1.0 / completed));
                         pc.setCellStyle(percent);
                     }
-                } else {
-                    // SINGLE / MULTI
+                } else { // SINGLE / MULTI
                     Map<String,Integer> cnt = new LinkedHashMap<>();
-                    for (Option o : q.getOptions()) {
-                        if (!o.isOther()) cnt.put(o.getText(), 0);
-                    }
-                    Map<String,Integer> other = new LinkedHashMap<>();
+                    for (Option o : q.getOptions()) if (!o.isOther()) cnt.put(o.getText(), 0);
+                    Map<String,Integer> otherMap = new LinkedHashMap<>();
 
                     if (q.getType() == QuestionType.SINGLE) {
                         for (var m : rows) {
@@ -139,12 +118,12 @@ public class AdminService {
                             if (txt.startsWith("Другое: ")) {
                                 String payload = txt.substring("Другое: ".length()).trim();
                                 if (payload.isEmpty()) payload="(без текста)";
-                                other.merge(payload,1,Integer::sum);
+                                otherMap.merge(payload,1,Integer::sum);
                             } else {
                                 cnt.merge(txt,1,Integer::sum);
                             }
                         }
-                    } else { // MULTI: json-массив
+                    } else { // MULTI
                         for (var m : rows) {
                             if (!q.getId().equals((String)m.get("q"))) continue;
                             String json = (String)m.get("json");
@@ -155,7 +134,7 @@ public class AdminService {
                                     if (s.startsWith("Другое: ")) {
                                         String payload = s.substring("Другое: ".length()).trim();
                                         if (payload.isEmpty()) payload="(без текста)";
-                                        other.merge(payload,1,Integer::sum);
+                                        otherMap.merge(payload,1,Integer::sum);
                                     } else {
                                         cnt.merge(s,1,Integer::sum);
                                     }
@@ -164,35 +143,34 @@ public class AdminService {
                         }
                     }
 
-                    // выводим сначала известные
+                    // выводим сначала известные варианты
                     for (var e : cnt.entrySet()) {
                         Row r = sh.createRow(rowIdx++);
                         r.createCell(0).setCellValue(e.getKey());
                         r.createCell(1).setCellValue(e.getValue());
                         Cell pc = r.createCell(2);
-                        pc.setCellValue(completed == 0 ? 0.0 : (e.getValue()*1.0/completed));
+                        pc.setCellValue(completed == 0 ? 0.0 : (e.getValue() * 1.0 / completed));
                         pc.setCellStyle(percent);
                     }
-                    // затем «Другое (текст)»
-                    for (var e : other.entrySet()) {
+                    // затем «другое»
+                    for (var e : otherMap.entrySet()) {
                         Row r = sh.createRow(rowIdx++);
                         r.createCell(0).setCellValue("Другое: " + e.getKey());
                         r.createCell(1).setCellValue(e.getValue());
                         Cell pc = r.createCell(2);
-                        pc.setCellValue(completed == 0 ? 0.0 : (e.getValue()*1.0/completed));
+                        pc.setCellValue(completed == 0 ? 0.0 : (e.getValue() * 1.0 / completed));
                         pc.setCellStyle(percent);
                     }
                 }
 
-                // Безопасное авто-выравнивание/ширина: autoSize может падать в headless/без шрифтов,
-                // поэтому пробуем и в случае ошибки ставим фиксированную ширину.
-                for (int col = 0; col <= 2; col++) {
-                    try {
-                        sh.autoSizeColumn(col);
-                    } catch (Throwable th) {
-                        try { sh.setColumnWidth(col, 20 * 256); } catch (Throwable ignore) {}
-                    }
-                }
+                // пустая строка между вопросами
+                rowIdx++;
+            }
+
+            // Попытаться авторазмерить колонки; если не получится (headless), выставить фиксированную ширину.
+            for (int col = 0; col <= 2; col++) {
+                try { sh.autoSizeColumn(col); }
+                catch (Throwable t) { try { sh.setColumnWidth(col, 20 * 256); } catch (Throwable ignore) {} }
             }
 
             // в байты
